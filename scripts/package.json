@@ -1,0 +1,8 @@
+{
+  "name": "multimodal-recognition",
+  "private": true,
+  "type": "commonjs",
+  "dependencies": {
+    "openai": "^4.70.0"
+  }
+}
