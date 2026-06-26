@@ -9,10 +9,10 @@
  *   node recognize.js <input1> [input2...] [--prompt "..."] [--model "..."] [--max-tokens N] [--timeout MS] [--clipboard]
  *
  * 输入支持四种格式:
- *   1. 本地绝对路径:     C:\path\to\photo.png
- *   2. 网络 URL:         https://example.com/image.jpg
- *   3. Data URI（剪贴板）: data:image/png;base64,iVBORw0KGgo...
- *   4. --clipboard:       从 Windows 剪贴板读取图片（仅支持单张）
+ *   1. 本地绝对路径:    C:\path\to\photo.png
+ *   2. 网络 URL:       https://example.com/image.jpg
+ *   3. Data URI:      data:image/png;base64,iVBORw0KGgo...
+ *   4. --clipboard:   从 Windows 剪贴板读取图片（仅支持单张）
  *
  * 依赖: npm install --prefix 本脚本所在目录
  */
