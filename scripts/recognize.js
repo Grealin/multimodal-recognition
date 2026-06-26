@@ -110,7 +110,7 @@ function loadEnv(skillScriptDir) {
  *   - Windows 剪贴板同时只保留一张图片（最近一次复制的）
  *   - 如需对照 [Unsupported Image] 提示，请逐张重新复制到剪贴板后调用
  *
- * @returns {string | null} 成功返回 data:image/png;base64,... 字符串，失败返回 null
+ * @returns {string | null} 成功返回临时 PNG 文件路径，失败返回 null
  */
 function readClipboardImage() {
   if (process.platform !== 'win32') {
@@ -148,33 +148,19 @@ function readClipboardImage() {
     ], { encoding: 'utf-8', timeout: 15000 }).trim();
 
     // 清理临时脚本
-    try { fs.unlinkSync(ps1Path); } catch {}
+    try { fs.unlinkSync(ps1Path); } catch { /* 文件可能已被删除，忽略 */ }
 
     if (result === 'EMPTY' || !fs.existsSync(outPath)) {
       console.error('[error] 剪贴板中没有图片数据。请先截图或复制一张图片到剪贴板，然后重试。');
       return null;
     }
 
-    // 读取 PNG 并编码为 Data URI
-    const imgBuf = fs.readFileSync(outPath);
-    const b64 = imgBuf.toString('base64');
-    const dataUri = `data:image/png;base64,${b64}`;
-
-    // 保留最近 10 个临时文件，清理旧文件
-    try {
-      const files = fs.readdirSync(tmpDir)
-        .filter(f => f.startsWith('clipboard_') && f.endsWith('.png'))
-        .map(f => path.join(tmpDir, f))
-        .sort();
-      for (const f of files.slice(0, -10)) {
-        try { fs.unlinkSync(f); } catch {}
-      }
-    } catch {}
-
-    return dataUri;
+    // 返回临时文件路径，由 processInput() 走本地文件分支处理
+    // 避免 Data URI 过大导致 API 413 Request body size exceeds maximum allowed size
+    return outPath;
   } catch (err) {
     console.error(`[error] 读取剪贴板失败: ${err.message}`);
-    try { fs.unlinkSync(ps1Path); } catch {}
+    try { fs.unlinkSync(ps1Path); } catch { /* 清理失败，忽略 */ }
     return null;
   }
 }
@@ -184,25 +170,46 @@ function readClipboardImage() {
 // ============================================================
 
 /**
- * 清除 scripts/temp 目录中的所有文件。
- * 在每次识别结果输出后调用，避免临时文件累积。
+ * 清理 scripts/temp 目录中的临时文件：
+ *   - 删除所有非剪贴板自动生成的文件（如 _reader.ps1 等）
+ *   - 仅保留最近 10 次剪贴板图片（clipboard_*.png），删除更旧的
  *
- * 行为：
- *   - 如果 temp 目录不存在，直接跳过
- *   - 删除目录内的所有文件（不递归子目录）
- *   - 清理失败时仅记录错误，不中断主流程
+ * 在每次识别结果输出后调用，避免临时文件累积。
+ * 失败时仅记录错误，不中断主流程。
  */
 function cleanTempDir() {
   const tmpDir = path.join(__dirname, 'temp');
   try {
     if (!fs.existsSync(tmpDir)) return;
     const entries = fs.readdirSync(tmpDir);
+
+    const clipboardFiles = [];
+    const otherFiles = [];
+
     for (const entry of entries) {
       const fullPath = path.join(tmpDir, entry);
-      try {
-        fs.unlinkSync(fullPath);
-      } catch (err) {
-        console.error(`[warn] 清理临时文件失败: ${fullPath} — ${err.message}`);
+      if (entry.startsWith('clipboard_') && entry.endsWith('.png')) {
+        clipboardFiles.push(fullPath);
+      } else {
+        otherFiles.push(fullPath);
+      }
+    }
+
+    // 1) 删除所有非剪贴板图片的临时文件
+    for (const f of otherFiles) {
+      try { fs.unlinkSync(f); } catch { /* 文件可能已被删除，忽略 */ }
+    }
+
+    // 2) 剪贴板图片按时间戳升序排列（旧→新），仅保留最近 10 个
+    if (clipboardFiles.length > 10) {
+      clipboardFiles.sort((a, b) => {
+        const ta = parseInt(path.basename(a).replace('clipboard_', '').replace('.png', ''), 10);
+        const tb = parseInt(path.basename(b).replace('clipboard_', '').replace('.png', ''), 10);
+        return ta - tb;
+      });
+      // slice(0, -10) 取出最旧的文件，将其删除
+      for (const f of clipboardFiles.slice(0, -10)) {
+        try { fs.unlinkSync(f); } catch { /* 文件可能已被删除，忽略 */ }
       }
     }
   } catch (err) {
@@ -339,6 +346,33 @@ function detectFileType(filePath) {
   }
 
   return info;
+}
+
+/**
+ * 生成简短的输入显示名称
+ * - Data URI: 截断 base64 内容，保留 MIME 前缀和后 20 个字符
+ * - 本地文件: 只显示文件名
+ * - URL/其他: 保持原样
+ * @param {string} input
+ * @returns {string}
+ */
+function shortDisplayName(input) {
+  if (!input) return 'input';
+
+  if (isDataURI(input)) {
+    const commaIdx = input.indexOf(',');
+    if (commaIdx !== -1) {
+      const header = input.slice(0, commaIdx + 1);
+      const b64 = input.slice(commaIdx + 1);
+      if (b64.length <= 40) return input;
+      const suffix = b64.slice(-20);
+      return `${header}...${suffix}`;
+    }
+  }
+
+  if (isURL(input)) return input;
+  if (input.includes('/') || input.includes('\\')) return path.basename(input);
+  return input;
 }
 
 // ============================================================
@@ -521,7 +555,7 @@ async function processInput(input, options) {
   try {
     let category, contentPart;
 
-    // 情况 1: Data URI（剪贴板）
+    // 情况 1: Data URI
     if (isDataURI(input)) {
       console.error(`[info] 处理 Data URI (${label})...`);
       const parsed = parseDataURI(input);
@@ -542,7 +576,8 @@ async function processInput(input, options) {
       try {
         fileInfo = detectFileType(urlPath);
       } catch {
-        // URL 无法从路径推断类型时，默认按图片处理（最常见的 URL 场景）
+        // URL 无法从路径推断类型时，默认按图片处理
+        console.error(`[warn] 无法从 URL 路径推断文件类型，默认按 image/jpeg 处理: ${input}`);
         fileInfo = { category: 'image', mimeType: 'image/jpeg', format: 'jpeg' };
       }
       category = fileInfo.category;
@@ -660,7 +695,7 @@ function printUsage() {
 function formatResults(results) {
   const lines = [];
   for (const r of results) {
-    lines.push(`=== FILE: ${r.input} ===`);
+    lines.push(`=== FILE: ${shortDisplayName(r.input)} ===`);
     if (r.category) {
       lines.push(`TYPE: ${r.category}`);
     }
@@ -671,7 +706,7 @@ function formatResults(results) {
     } else {
       lines.push('(无输出)');
     }
-    lines.push(`=== END: ${path.basename(r.input || 'input')} ===`);
+    lines.push(`=== END: ${shortDisplayName(r.input || 'input')} ===`);
     lines.push('');
   }
   return lines.join('\n').trim();
@@ -702,9 +737,9 @@ async function main() {
   const clipboardInputs = [];
   if (cliOptions.clipboard) {
     console.error('[info] 正在从 Windows 剪贴板读取图片...');
-    const dataUri = readClipboardImage();
-    if (dataUri) {
-      clipboardInputs.push(dataUri);
+    const clipPath = readClipboardImage();
+    if (clipPath) {
+      clipboardInputs.push(clipPath);
       console.error('[info] 剪贴板图片读取成功');
     }
     delete cliOptions.clipboard; // 避免误传
